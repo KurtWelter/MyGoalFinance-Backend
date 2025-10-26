@@ -1,0 +1,13 @@
+{
+  "$schema": "https://deno.land/x/deno/cli/schemas/config-file.v1.json",
+  "compilerOptions": { "lib": ["deno.window", "deno.ns"] },
+  "imports": {
+    "@supabase/supabase-js": "npm:@supabase/supabase-js@2"
+
+  },
+  "lint": {
+    "rules": {
+      "exclude": ["no-explicit-any"] 
+    }
+  }
+}
