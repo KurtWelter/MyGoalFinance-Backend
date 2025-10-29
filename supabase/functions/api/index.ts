@@ -19,6 +19,10 @@ type Ctx = {
   profileId: number | null;
 };
 
+// 🔗 Deep link de confirmación de email
+const EMAIL_REDIRECT_TO =
+  Deno.env.get("EMAIL_REDIRECT_TO") ?? "mygoalfinance://auth/callback";
+
 // CORS helpers
 function withCORS(res: Response) {
   const h = new Headers(res.headers);
@@ -61,21 +65,45 @@ function monthToRange(ym?: string) {
 }
 
 /** Asegura/obtiene el id de user_profile del usuario autenticado
- *  🔴 IMPORTANTE: en tu tabla el campo es id_supabase (uuid del auth.user)
+ *  IMPORTANTE: en tu tabla el campo es id_supabase (uuid del auth.user)
+ *  Esta versión tolera duplicados y crea el perfil si no existe.
  */
 async function ensureProfileId(ctx: Ctx): Promise<number> {
   if (!ctx.user) throw new Error("Unauthenticated");
   if (ctx.profileId) return ctx.profileId;
 
-  const { data, error } = await ctx.admin
+  // Intentar obtener el perfil más reciente por id (tolerante a duplicados)
+  const { data: row, error } = await ctx.admin
     .from("user_profile")
     .select("id")
-    .eq("id_supabase", ctx.user.id) // ← campo correcto en tu tabla
+    .eq("id_supabase", ctx.user.id)
+    .order("id", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    // Log no fatal; continuamos a crear si fuese necesario
+    console.log("ensureProfileId select warn:", error.message || error);
+  }
+
+  if (row && (row as any).id) {
+    ctx.profileId = (row as any).id;
+    return (row as any).id;
+  }
+
+  // Si no hay perfil, crearlo con datos mínimos
+  const { data: created, error: e2 } = await ctx.admin
+    .from("user_profile")
+    .insert({
+      id_supabase: ctx.user.id,
+      email: ctx.user.email ?? null,
+    })
+    .select("id")
     .single();
 
-  if (error) throw new Error(error.message || "Perfil no encontrado");
-  ctx.profileId = data.id;
-  return data.id;
+  if (e2) throw new Error(e2.message || "No se pudo crear el perfil");
+  ctx.profileId = created.id;
+  return created.id;
 }
 
 /* ─────────────────────────────────── AUTH ─────────────────────────────────── */
@@ -106,7 +134,11 @@ async function authRegister(req: Request, ctx: Ctx) {
   const { data, error } = await ctx.sb.auth.signUp({
     email,
     password,
-    options: { data: { name } },
+    options: {
+      data: { name },
+      // 🔗 clave para abrir tu app tras confirmar el correo
+      emailRedirectTo: EMAIL_REDIRECT_TO,
+    },
   });
   if (error) return jsonErr(error.message || "No se pudo registrar", 400);
 
@@ -150,8 +182,8 @@ async function updateProfile(req: Request, ctx: Ctx) {
 }
 
 /* ────────────────────────────── TRANSACTIONS ──────────────────────────────
-   Tu tabla: transaction { id, user_id, amount, type, category_id?, description, occurred_at (date), created_at (timestamptz) }
-   NOTA: Usamos occurred_at para filtros por fecha.
+   Tu tabla: transaction { id, user_id, amount, type, category_id?, description,
+   occurred_at (date), created_at (timestamptz) }
 --------------------------------------------------------------------------- */
 
 async function listTransactions(req: Request, ctx: Ctx) {
@@ -237,7 +269,8 @@ async function summaryMonth(req: Request, ctx: Ctx) {
 }
 
 /* ────────────────────────────────── GOALS ─────────────────────────────────
-   Tu tabla: financial_goal { id, user_id, title, description, target_amount, current_amount, deadline, created_at, updated_at }
+   Tu tabla: financial_goal { id, user_id, title, description, target_amount,
+   current_amount, deadline, created_at, updated_at }
 --------------------------------------------------------------------------- */
 
 async function listGoals(_req: Request, ctx: Ctx) {
