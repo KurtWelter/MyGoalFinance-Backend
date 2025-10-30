@@ -1,8 +1,7 @@
 // supabase/functions/api/index.ts
 // API unificada para MyGoalFinance (auth, profile, transactions, goals, news,
-// recommendations, chat con GROQ y push). Adaptada a tu esquema real.
+// recommendations, chat con GROQ y push).
 
-// Import mapeado en deno.json → "@supabase/supabase-js": "npm:@supabase/supabase-js@2"
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
 /* ───────────────────────────── Tipos y helpers base ───────────────────────────── */
@@ -10,6 +9,7 @@ import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 type UserLike = {
   id: string;
   email?: string | null;
+  user_metadata?: Record<string, unknown> | null;
 } | null;
 
 type Ctx = {
@@ -64,10 +64,7 @@ function monthToRange(ym?: string) {
   return { from, to };
 }
 
-/** Asegura/obtiene el id de user_profile del usuario autenticado
- *  IMPORTANTE: en tu tabla el campo es id_supabase (uuid del auth.user)
- *  Esta versión tolera duplicados y crea el perfil si no existe.
- */
+/** Asegura/obtiene el id de user_profile del usuario autenticado */
 async function ensureProfileId(ctx: Ctx): Promise<number> {
   if (!ctx.user) throw new Error("Unauthenticated");
   if (ctx.profileId) return ctx.profileId;
@@ -82,7 +79,6 @@ async function ensureProfileId(ctx: Ctx): Promise<number> {
     .maybeSingle();
 
   if (error) {
-    // Log no fatal; continuamos a crear si fuese necesario
     console.log("ensureProfileId select warn:", error.message || error);
   }
 
@@ -91,12 +87,20 @@ async function ensureProfileId(ctx: Ctx): Promise<number> {
     return (row as any).id;
   }
 
-  // Si no hay perfil, crearlo con datos mínimos
+  // ⚠️ La tabla exige "name" NOT NULL → construir un valor por defecto seguro
+  const meta = (ctx.user?.user_metadata || {}) as Record<string, unknown>;
+  const metaName = typeof meta.name === "string" ? meta.name.trim() : "";
+  const fallbackFromEmail =
+    (ctx.user?.email && String(ctx.user.email).split("@")[0]) || "";
+  const safeName = metaName || fallbackFromEmail || "Usuario";
+
+  // Crear perfil mínimo
   const { data: created, error: e2 } = await ctx.admin
     .from("user_profile")
     .insert({
       id_supabase: ctx.user.id,
       email: ctx.user.email ?? null,
+      name: safeName, // ⬅️ evita error NOT NULL
     })
     .select("id")
     .single();
@@ -171,6 +175,12 @@ async function getProfile(_req: Request, ctx: Ctx) {
 async function updateProfile(req: Request, ctx: Ctx) {
   const pid = await ensureProfileId(ctx);
   const body = await readJson(req);
+
+  // Si envían name vacío, no lo sobrescribas a null en tablas NOT NULL
+  if (typeof body.name === "string" && body.name.trim() === "") {
+    delete (body as any).name;
+  }
+
   const { data, error } = await ctx.admin
     .from("user_profile")
     .update(body)
@@ -181,10 +191,51 @@ async function updateProfile(req: Request, ctx: Ctx) {
   return jsonOK(data);
 }
 
-/* ────────────────────────────── TRANSACTIONS ──────────────────────────────
-   Tu tabla: transaction { id, user_id, amount, type, category_id?, description,
-   occurred_at (date), created_at (timestamptz) }
---------------------------------------------------------------------------- */
+// ───────────────────────────── PROFILE: subir avatar ─────────────────────────────
+async function uploadAvatar(req: Request, ctx: Ctx) {
+  const pid = await ensureProfileId(ctx);
+
+  const ctype = req.headers.get("content-type") || "";
+  if (!ctype.toLowerCase().includes("multipart/form-data")) {
+    return jsonErr('Se espera multipart/form-data con campo "file"', 400);
+  }
+
+  const form = await req.formData();
+  const file = form.get("file");
+  if (!(file instanceof File)) return jsonErr('Falta el archivo en el campo "file"', 400);
+
+  const buf = new Uint8Array(await file.arrayBuffer());
+  const mime = file.type || "image/jpeg";
+
+  // Extensión simple por mime
+  const ext =
+    mime.includes("png") ? "png" :
+    mime.includes("webp") ? "webp" :
+    "jpg";
+
+  // Ruta destino en el bucket
+  const path = `avatars/${pid}/${Date.now()}.${ext}`;
+
+  // Subir al bucket "avatars" (debe existir)
+  const { error: upErr } = await ctx.admin.storage
+    .from("avatars")
+    .upload(path, buf, { contentType: mime, upsert: true });
+
+  if (upErr) return jsonErr(upErr.message, 400);
+
+  // URL pública (si el bucket es público)
+  const pub = ctx.admin.storage.from("avatars").getPublicUrl(path);
+  const publicUrl = pub?.data?.publicUrl || "";
+
+  // Guardar en el perfil
+  await ctx.admin.from("user_profile")
+    .update({ avatar_url: publicUrl })
+    .eq("id", pid);
+
+  return jsonOK({ url: publicUrl });
+}
+
+/* ────────────────────────────── TRANSACTIONS ────────────────────────────── */
 
 async function listTransactions(req: Request, ctx: Ctx) {
   const pid = await ensureProfileId(ctx);
@@ -257,8 +308,7 @@ async function summaryMonth(req: Request, ctx: Ctx) {
 
   if (error) return jsonErr(error.message, 400);
 
-  let inc = 0,
-    exp = 0;
+  let inc = 0, exp = 0;
   for (const t of data || []) {
     const v = Number((t as any).amount || 0);
     if (v >= 0) inc += v;
@@ -268,10 +318,7 @@ async function summaryMonth(req: Request, ctx: Ctx) {
   return jsonOK({ month: month || "", inc, exp, net, from: range.from, to: range.to });
 }
 
-/* ────────────────────────────────── GOALS ─────────────────────────────────
-   Tu tabla: financial_goal { id, user_id, title, description, target_amount,
-   current_amount, deadline, created_at, updated_at }
---------------------------------------------------------------------------- */
+/* ────────────────────────────────── GOALS ───────────────────────────────── */
 
 async function listGoals(_req: Request, ctx: Ctx) {
   const pid = await ensureProfileId(ctx);
@@ -405,11 +452,7 @@ async function listContributions(_req: Request, ctx: Ctx, goalId: number) {
   return jsonOK(data || []);
 }
 
-/* ─────────────────────────────────── NEWS ───────────────────────────────────
-   Tablas reales:
-   - fx_snapshot { base, usd, eur, uf, taken_at }  → usamos taken_at
-   - news_seen { article_id, title, url, source, published_at, first_seen } → devolvemos id = article_id
---------------------------------------------------------------------------- */
+/* ─────────────────────────────────── NEWS ─────────────────────────────────── */
 
 async function newsRates(_req: Request, ctx: Ctx) {
   const { data, error } = await ctx.admin
@@ -472,18 +515,14 @@ async function pushRegister(req: Request, ctx: Ctx) {
 
   const { error } = await ctx.admin
     .from("push_token")
-    .upsert({ user_id: pid, token, platform })
-    .eq("user_id", pid)
+    .upsert({ user_id: pid, token, platform }, { onConflict: "token" })
     .select();
 
   if (error) return jsonErr(error.message, 400);
   return jsonOK({ ok: true });
 }
 
-/* ─────────────────────────────────── CHAT ───────────────────────────────────
-   Tabla real: chat_message { id, user_id, sender, message, timestamp }
-   Ordenamos por timestamp (no created_at) y lo rellenamos si hace falta.
---------------------------------------------------------------------------- */
+/* ─────────────────────────────────── CHAT ─────────────────────────────────── */
 
 async function chatHistory(_req: Request, ctx: Ctx) {
   const pid = await ensureProfileId(ctx);
@@ -586,6 +625,14 @@ Deno.serve(async (req) => {
   if (!path.startsWith("/api")) path = "/api" + path; // asegurar prefijo /api
   const p = path.replace(/^\/api/, "") || "/";
 
+  // Log
+  console.log(`[api] ${req.method} ${p}`);
+
+  // Healthcheck público
+  if (p === "/health" && (req.method === "GET" || req.method === "HEAD")) {
+    return withCORS(jsonOK({ ok: true, time: new Date().toISOString() }));
+  }
+
   // Clients
   const sb = createClient(SUPABASE_URL, ANON_KEY, {
     global: { headers: { Authorization: req.headers.get("Authorization") ?? "" } },
@@ -607,6 +654,7 @@ Deno.serve(async (req) => {
     // ─── PROFILE
     if (p === "/profile" && req.method === "GET") return withCORS(await getProfile(req, ctx));
     if (p === "/profile" && req.method === "PUT") return withCORS(await updateProfile(req, ctx));
+    if (p === "/profile/avatar" && req.method === "POST") return withCORS(await uploadAvatar(req, ctx)); // ⬅️ NUEVO
 
     // ─── TRANSACTIONS
     if (p === "/transactions" && req.method === "GET") return withCORS(await listTransactions(req, ctx));
@@ -627,8 +675,9 @@ Deno.serve(async (req) => {
       return withCORS(await contributeGoal(req, ctx, Number(mContrib[1])));
 
     const mListContrib = p.match(/^\/goals\/contributions\/(\d+)$/);
-    if (mListContrib && req.method === "GET")
+    if (mListContrib && req.method === "GET") {
       return withCORS(await listContributions(req, ctx, Number(mListContrib[1])));
+    }
 
     // ─── NEWS
     if (p === "/news/rates" && req.method === "GET") return withCORS(await newsRates(req, ctx));
@@ -650,6 +699,7 @@ Deno.serve(async (req) => {
     return withCORS(jsonErr(`Not Found: ${p}`, 404));
   } catch (e: unknown) {
     const msg = (e && typeof e === "object" && "message" in e) ? String((e as any).message) : "Internal error";
+    console.log("[api][error]", msg);
     return withCORS(jsonErr(msg, 400));
   }
 });
